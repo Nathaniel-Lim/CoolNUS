@@ -4,13 +4,13 @@ const START = '2026-10-31T04:00:00.000Z';
 const live = s => s.pilots.filter(p => !['departed', 'diverted'].includes(p.phase));
 export const allCrews = s => s.ground.crews.flat();
 export const timestamp = s => new Date(Date.parse(s.startedAt) + s.elapsedSeconds * 1000).toISOString();
-function record(s, kind, message, entityId = null) {
+export function record(s, kind, message, entityId = null) {
   s.events.unshift({ id: s.nextEventId++, at: timestamp(s), kind, message, entityId });
   s.events = s.events.slice(0, 200);
 }
 export function initialState() {
   const s = {
-    schemaVersion: '1.0', revision: 0, startedAt: START, elapsedSeconds: 0,
+    schemaVersion: '1.1', revision: 0, startedAt: START, elapsedSeconds: 0,
     running: false, speed: 5, autoDispatch: true, nextEventId: 1, nextIncidentId: 1,
     units: { fuel: 'kg', durations: 'seconds', times: 'ISO-8601 UTC' },
     assumptions: ['Synthetic training airport; not operational aviation software.', 'Runway use: 60s arrival, 45s departure, 30s minimum reuse gap.', 'One aircraft reserves a taxiway for its complete taxi movement.', 'Fuel burn: airborne 0.7 kg/s, taxi/active runway 0.15 kg/s; reserve 900 kg.', 'Emergency, repair and inspection durations are scenario assumptions.'],
@@ -20,6 +20,7 @@ export function initialState() {
       taxiways: [resource('TWY-A', 'Alpha'), resource('TWY-B', 'Bravo')],
       gates: Array.from({ length: 6 }, (_, i) => ({ ...resource(`G${i + 1}`, `Gate ${i + 1}`), taxiwayId: i < 3 ? 'TWY-A' : 'TWY-B' }))
     },
+    data: { airportCatalog: [], flightImports: [], disruptions: [], activeFlightId: null },
     atc: { id: 'ATC-1', name: 'Airport-wide traffic coordinator' },
     ground: {
       crewTypeOrder: CREW_TYPES,
@@ -33,6 +34,7 @@ export function initialState() {
     pilots: Array.from({ length: 6 }, (_, i) => ({
       id: `P-${i + 1}`, name: ['Aisha Tan', 'Daniel Lim', 'Priya Nair', 'Noah Chen', 'Sara Wong', 'Ethan Lee'][i],
       aircraftId: `AC-${i + 1}`, callsign: ['SG218', 'AX604', 'SQ382', 'TR119', 'JL708', 'QF036'][i],
+      source: 'synthetic', onBlockAt: i < 2 ? START : null,
       phase: i < 2 ? 'at_gate' : 'approach', fuelRemainingKg: i < 2 ? 3800 : 2600 + i * 120,
       reserveFuelKg: 900, expectedArrival: new Date(Date.parse(START) + (i < 2 ? 0 : (i - 1) * 80000)).toISOString(),
       expectedDeparture: new Date(Date.parse(START) + (i < 2 ? 180 + i * 100 : 700 + i * 130) * 1000).toISOString(),
@@ -47,7 +49,7 @@ export function initialState() {
 function resource(id, name) { return { id, name, status: 'open', occupiedBy: null, reason: null }; }
 function findResource(s, id) { return [...s.airport.runways, ...s.airport.taxiways, ...s.airport.gates].find(r => r.id === id); }
 function requireValue(condition, message) { if (!condition) throw new Error(message); }
-function available(r) { return r.status === 'open' && !r.occupiedBy; }
+function available(r) { return r.status === 'open' && !r.occupiedBy && !r.backgroundOccupied; }
 function readyTask(s, t) { return t.status === 'queued' && t.dependsOn.every(id => s.tasks.find(x => x.id === id)?.status === 'completed'); }
 function assignTask(s, crew, task) {
   requireValue(crew.status === 'available', 'Crew member is not available.');
@@ -89,10 +91,20 @@ function releaseRunway(s, p) {
   runway.occupiedBy = null; runway.availableAfter = s.elapsedSeconds + 30;
 }
 function chooseRunway(s, p) {
-  return s.airport.runways.find(r => available(r) && r.availableAfter <= s.elapsedSeconds && (!p.plannedRunwayId || r.id === p.plannedRunwayId));
+  return s.airport.runways.find(r => available(r) && r.availableAfter <= s.elapsedSeconds && (!p.plannedRunwayId || r.id === p.plannedRunwayId) && capacityAvailable(s,r));
+}
+function capacityAvailable(s, runway) {
+  const config=s.airport.configuration;if(!config)return true;
+  const recent=(s.airport.operationHistory||[]).filter(o=>o.atSeconds>s.elapsedSeconds-3600 && (config.capacityScope==='airport'||o.runwayId===runway.id));
+  return recent.length<config.max_runway_ops_per_hour;
+}
+function logOperation(s,p,kind) {
+  s.airport.operationHistory??=[];
+  s.airport.operationHistory=s.airport.operationHistory.filter(o=>o.atSeconds>s.elapsedSeconds-3600);
+  s.airport.operationHistory.push({atSeconds:s.elapsedSeconds,runwayId:p.runwayId,aircraftId:p.aircraftId,kind});
 }
 function burnFuel(s, p) {
-  if (['departed', 'diverted', 'at_gate', 'ready'].includes(p.phase)) return;
+  if (['departed', 'diverted', 'at_gate', 'ready', 'awaiting_stand'].includes(p.phase)) return;
   const rate = ['approach', 'holding'].includes(p.phase) ? 0.7 : 0.15;
   p.fuelRemainingKg = Math.max(0, p.fuelRemainingKg - rate);
   if (p.fuelRemainingKg <= p.reserveFuelKg && !p.fuelAlerted) {
@@ -108,22 +120,29 @@ function tickPilot(s, p) {
   burnFuel(s, p);
   if (['departed', 'diverted'].includes(p.phase)) return;
   if (p.remainingSeconds > 0) p.remainingSeconds--;
+  if (p.phase === 'awaiting_stand') {
+    const gate=s.airport.gates.find(available);if(!gate)return;
+    gate.occupiedBy=p.aircraftId;p.gateId=gate.id;p.phase='at_gate';
+    record(s,'movement',`${p.callsign} assigned ${gate.id}; imported delay still governs departure.`,p.id);return;
+  }
   if (p.phase === 'landing' && p.remainingSeconds === 0) {
     releaseRunway(s, p); p.phase = 'taxi_in'; p.remainingSeconds = 90;
     record(s, 'movement', `${p.callsign} landed; taxiing to ${p.gateId}.`, p.id); return;
   }
   if (p.phase === 'taxi_in' && p.remainingSeconds === 0) {
-    findResource(s, p.taxiwayId).occupiedBy = null; p.phase = 'at_gate'; p.remainingSeconds = 180;
+    findResource(s, p.taxiwayId).occupiedBy = null; p.phase = 'at_gate'; p.remainingSeconds = s.airport.configuration ? s.airport.configuration.min_turnaround_min * 60 : 180;
+    p.onBlockAt=timestamp(s);if(p.simulatedActual)p.simulatedActual.onBlockAt=timestamp(s);
     record(s, 'movement', `${p.callsign} arrived at ${p.gateId}; turnaround started.`, p.id); return;
   }
   if (p.phase === 'at_gate' && p.remainingSeconds === 0 && !p.maintenanceHold) {
     p.phase = 'ready'; record(s, 'movement', `${p.callsign} ready for departure.`, p.id);
   }
-  if (p.phase === 'ready' && !p.maintenanceHold && s.elapsedSeconds >= p.holdUntil && Date.parse(timestamp(s)) >= Date.parse(p.expectedDeparture)) {
+  if (p.phase === 'ready' && !p.maintenanceHold && s.elapsedSeconds >= p.holdUntil && Date.parse(timestamp(s)) >= Math.max(Date.parse(p.expectedDeparture),Date.parse(p.earliestOffBlockAt||p.expectedDeparture))) {
     const gate = findResource(s, p.gateId), taxiway = findResource(s, gate.taxiwayId);
     if (gate.status !== 'open' || !available(taxiway)) return;
     gate.occupiedBy = null; taxiway.occupiedBy = p.aircraftId; p.taxiwayId = taxiway.id;
     p.phase = 'taxi_out'; p.remainingSeconds = 90;
+    if(p.simulatedActual)p.simulatedActual.offBlockAt=timestamp(s);
     record(s, 'movement', `${p.callsign} pushed back; outbound on ${taxiway.name}.`, p.id); return;
   }
   if (p.phase === 'taxi_out' && p.remainingSeconds === 0) p.phase = 'holding_short';
@@ -132,10 +151,12 @@ function tickPilot(s, p) {
     if (!runway) return;
     runway.occupiedBy = p.aircraftId; findResource(s, p.taxiwayId).occupiedBy = null;
     p.runwayId = runway.id; p.phase = 'takeoff'; p.remainingSeconds = 45;
+    logOperation(s,p,'departure');
     record(s, 'movement', `${p.callsign} cleared for simulated departure on ${runway.name}.`, p.id); return;
   }
   if (p.phase === 'takeoff' && p.remainingSeconds === 0) {
     releaseRunway(s, p); p.phase = 'departed'; p.actualDeparture = timestamp(s);
+    if(p.simulatedActual)p.simulatedActual.wheelsOffAt=timestamp(s);
     record(s, 'movement', `${p.callsign} departed.`, p.id); return;
   }
   if (['approach', 'holding'].includes(p.phase)) {
@@ -150,6 +171,7 @@ function tickPilot(s, p) {
     p.gateId = gate.id; p.taxiwayId = gate.taxiwayId; p.runwayId = runway.id;
     gate.occupiedBy = p.aircraftId; findResource(s, p.taxiwayId).occupiedBy = p.aircraftId; runway.occupiedBy = p.aircraftId;
     p.phase = 'landing'; p.remainingSeconds = 60;
+    logOperation(s,p,'arrival');
     record(s, 'movement', `${p.callsign} assigned ${runway.name} → ${p.taxiwayId} → ${gate.id}.`, p.id);
   }
 }
@@ -191,7 +213,7 @@ export function command(state, action, actor = { role: 'operator', id: 'OPERATOR
     case 'resource_status': {
       const r = findResource(s, action.targetId);
       requireValue(r, 'Unknown resource.'); requireValue(['open', 'closed'].includes(action.status), 'Status must be open or closed.');
-      requireValue(!r.occupiedBy, 'Resource is occupied or reserved; wait until the movement clears.');
+      requireValue(!r.occupiedBy && !r.backgroundOccupied, 'Resource is occupied or reserved; wait until the movement clears.');
       requireValue(!s.incidents.some(i => i.status === 'active' && i.targetId === r.id), 'Active incident: crew tasks must be completed before resource release.');
       r.status = action.status; r.reason = action.status === 'closed' ? 'Operator restriction' : null;
       record(s, 'resource', `${r.name} ${r.status}.`, r.id); break;
@@ -203,7 +225,7 @@ export function command(state, action, actor = { role: 'operator', id: 'OPERATOR
         requireValue(pilot && ['at_gate', 'ready'].includes(pilot.phase), 'Aircraft fault injection requires a pilot whose aircraft is at a stand.');
         requireValue(!pilot.maintenanceHold, 'Aircraft already has a maintenance hold.'); pilot.maintenanceHold = true;
       } else {
-        requireValue(target && !target.occupiedBy && target.status === 'open', 'Incident requires a free, open resource.');
+        requireValue(target && !target.occupiedBy && !target.backgroundOccupied && target.status === 'open', 'Incident requires a free, open resource.');
         if (['bird_strike', 'disabled_aircraft'].includes(action.kind)) requireValue(s.airport.runways.includes(target), 'This scenario requires a runway.');
         if (action.kind === 'surface_debris') requireValue(s.airport.taxiways.includes(target) || s.airport.runways.includes(target), 'Debris scenario requires a runway or taxiway.');
         target.status = 'closed'; target.reason = spec.title;
@@ -260,28 +282,28 @@ export function command(state, action, actor = { role: 'operator', id: 'OPERATOR
   s.revision++; assertState(s); return s;
 }
 export function observation(s, role, id) {
-  const base = { schemaVersion: s.schemaVersion, revision: s.revision, simulationTime: timestamp(s), elapsedSeconds: s.elapsedSeconds, units: s.units, role, actorId: id, assumptions: s.assumptions };
+  const base = { schemaVersion: s.schemaVersion, revision: s.revision, simulationTime: timestamp(s), elapsedSeconds: s.elapsedSeconds, units: s.units, role, actorId: id, assumptions: s.assumptions, futureAgentInterface: true, agentsImplemented: false, airportConfiguration: s.airport.configuration || null };
   if (role === 'atc') {
     requireValue(id === s.atc.id, 'Unknown ATC.');
-    return clone({ ...base, airport: s.airport, pilots: s.pilots, ground: s.ground, incidents: s.incidents, tasks: s.tasks, recentEvents: s.events.slice(0, 20), allowedCommands: ['resource_status', 'set_plan'] });
+    return clone({ ...base, airport: s.airport, pilots: s.pilots, ground: s.ground, incidents: s.incidents, tasks: s.tasks, importedScenarios: s.data?.flightImports || [], delayDisruptions: s.data?.disruptions || [], recentEvents: s.events.slice(0, 20), allowedCommands: ['resource_status', 'set_plan'] });
   }
   if (role === 'pilot') {
     const p = s.pilots.find(p => p.id === id); requireValue(p, 'Unknown pilot.');
     const ids = [p.gateId, p.runwayId, p.taxiwayId, p.plannedRunwayId];
-    return clone({ ...base, pilot: p, estimatedAirborneSecondsAboveReserve: Math.max(0, Math.floor((p.fuelRemainingKg - p.reserveFuelKg) / 0.7)),
+    return clone({ ...base, pilot: p, importedScenario: s.data?.flightImports.find(f=>f.pilotId===id)||null, delayDisruptions: s.data?.disruptions.filter(d=>d.pilotId===id)||[], estimatedAirborneSecondsAboveReserve: Math.max(0, Math.floor((p.fuelRemainingKg - p.reserveFuelKg) / 0.7)),
       assignedResources: [...s.airport.runways, ...s.airport.taxiways, ...s.airport.gates].filter(r => ids.includes(r.id)),
       ownIncidents: s.incidents.filter(i => i.targetId === id), airportRestrictions: [...s.airport.runways, ...s.airport.taxiways].filter(r => r.status !== 'open'), allowedCommands: ['hold'] });
   }
   requireValue(role === 'ground', 'Unknown observation role.');
   const crew = allCrews(s).find(c => c.id === id); requireValue(crew, 'Unknown ground personnel ID.');
   const own = s.tasks.find(t => t.id === crew.currentTaskId);
-  return clone({ ...base, crew, currentTask: own || null,
+  return clone({ ...base, crew, delayDisruptions: s.data?.disruptions.map(d=>({id:d.id,flightId:d.flightId,kind:d.kind,appliedDelayMinutes:d.appliedDelayMinutes,afterOffBlockUtc:d.afterOffBlockUtc}))||[], currentTask: own || null,
     incident: own ? s.incidents.find(i => i.id === own.incidentId) : null,
     availableTasks: s.tasks.filter(t => t.requiredType === crew.type && readyTask(s, t)),
     completedTasks: s.tasks.filter(t => t.assigneeId === id && t.status === 'completed'), allowedCommands: ['assign_task', 'crew_availability'] });
 }
 export function assertState(s) {
-  requireValue(s.schemaVersion === '1.0' && Number.isInteger(s.revision) && s.revision >= 0 && Number.isFinite(Date.parse(s.startedAt)) && Number.isInteger(s.elapsedSeconds) && s.elapsedSeconds >= 0, 'Invalid state header.');
+  requireValue(['1.0','1.1'].includes(s.schemaVersion) && Number.isInteger(s.revision) && s.revision >= 0 && Number.isFinite(Date.parse(s.startedAt)) && Number.isInteger(s.elapsedSeconds) && s.elapsedSeconds >= 0, 'Invalid state header.');
   requireValue(Array.isArray(s.ground.crews) && s.ground.crews.length === 3 && s.ground.crews.every(Array.isArray), 'Ground crews must be three nested lists.');
   const crews = allCrews(s);
   requireValue(new Set(crews.map(c => c.id)).size === crews.length, 'Crew IDs must be unique.');
@@ -293,11 +315,20 @@ export function assertState(s) {
     requireValue(['open', 'closed'].includes(r.status), 'Invalid resource status.');
     requireValue(!r.occupiedBy || live(s).some(p => p.aircraftId === r.occupiedBy), 'Resource has an invalid occupant.');
     requireValue(!(r.status === 'closed' && r.occupiedBy), 'Closed resource cannot have an aircraft reservation.');
+    requireValue(!(r.occupiedBy && r.backgroundOccupied),'Gate cannot contain both a modelled aircraft and background occupancy.');
   }
   for (const t of s.tasks.filter(t => t.status === 'active')) {
     const c = crews.find(c => c.id === t.assigneeId);
     requireValue(c && c.type === t.requiredType && c.currentTaskId === t.id && c.status === 'busy', 'Active task assignment is inconsistent.');
     requireValue(t.dependsOn.every(id => s.tasks.some(x => x.id === id && x.status === 'completed')), 'Task prerequisites incomplete.');
+  }
+  if(s.airport.configuration){
+    const c=s.airport.configuration;requireValue(s.airport.runways.length===c.active_runways && s.airport.gates.length===c.gates,'Airport counts disagree with imported configuration.');
+    requireValue(['airport','per_runway'].includes(c.capacityScope),'Airport capacity scope is required.');
+  }
+  if(s.data){
+    requireValue(new Set(s.data.flightImports.map(f=>f.id)).size===s.data.flightImports.length,'Duplicate imported flight occurrence.');
+    for(const f of s.data.flightImports)requireValue(s.pilots.some(p=>p.id===f.pilotId&&p.flightId===f.id),'Imported flight has no associated pilot.');
   }
   return true;
 }
