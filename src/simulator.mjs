@@ -1,3 +1,4 @@
+import { gateStatus } from './gate-status.mjs';
 export const CREW_TYPES = ['emergency_response', 'mechanic', 'inspector'];
 export const clone = value => structuredClone(value);
 const START = '2026-10-31T04:00:00.000Z';
@@ -285,12 +286,12 @@ export function observation(s, role, id) {
   const base = { schemaVersion: s.schemaVersion, revision: s.revision, simulationTime: timestamp(s), elapsedSeconds: s.elapsedSeconds, units: s.units, role, actorId: id, assumptions: s.assumptions, futureAgentInterface: true, agentsImplemented: false, airportConfiguration: s.airport.configuration || null };
   if (role === 'atc') {
     requireValue(id === s.atc.id, 'Unknown ATC.');
-    return clone({ ...base, airport: s.airport, pilots: s.pilots, ground: s.ground, incidents: s.incidents, tasks: s.tasks, importedScenarios: s.data?.flightImports || [], delayDisruptions: s.data?.disruptions || [], recentEvents: s.events.slice(0, 20), allowedCommands: ['resource_status', 'set_plan'] });
+    return clone({ ...base, airport: s.airport, pilots: s.pilots, gateOperations: s.pilots.map(p => ({pilotId:p.id, callsign:p.callsign, gateId:p.gateId, status:gateStatus(s,p)})).filter(p=>p.status), ground: s.ground, incidents: s.incidents, tasks: s.tasks, importedScenarios: s.data?.flightImports || [], delayDisruptions: s.data?.disruptions || [], recentEvents: s.events.slice(0, 20), allowedCommands: ['resource_status', 'set_plan'] });
   }
   if (role === 'pilot') {
     const p = s.pilots.find(p => p.id === id); requireValue(p, 'Unknown pilot.');
     const ids = [p.gateId, p.runwayId, p.taxiwayId, p.plannedRunwayId];
-    return clone({ ...base, pilot: p, importedScenario: s.data?.flightImports.find(f=>f.pilotId===id)||null, delayDisruptions: s.data?.disruptions.filter(d=>d.pilotId===id)||[], estimatedAirborneSecondsAboveReserve: Math.max(0, Math.floor((p.fuelRemainingKg - p.reserveFuelKg) / 0.7)),
+    return clone({ ...base, pilot: p, gateStatus:gateStatus(s,p), importedScenario: s.data?.flightImports.find(f=>f.pilotId===id)||null, delayDisruptions: s.data?.disruptions.filter(d=>d.pilotId===id)||[], estimatedAirborneSecondsAboveReserve: Math.max(0, Math.floor((p.fuelRemainingKg - p.reserveFuelKg) / 0.7)),
       assignedResources: [...s.airport.runways, ...s.airport.taxiways, ...s.airport.gates].filter(r => ids.includes(r.id)),
       ownIncidents: s.incidents.filter(i => i.targetId === id), airportRestrictions: [...s.airport.runways, ...s.airport.taxiways].filter(r => r.status !== 'open'), allowedCommands: ['hold'] });
   }

@@ -1,4 +1,5 @@
 import { setupImports } from './imports.js';
+import { gateStatus } from './gate-status.js';
 const $ = id => document.getElementById(id);
 let state, selectedRole = 'atc', selectedId = 'ATC-1', selectedResource = null, toastTimer, jsonText = '';
 const esc = x => String(x ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -33,7 +34,14 @@ function svgMap() {
   const active=state.pilots.filter(p=>!['departed','diverted'].includes(p.phase));
   const planes=active.map((p,i)=>{
     let x=130+(i%6)*150,y=35+Math.floor(i/6)*16,angle=90;
-    if(['at_gate','ready','awaiting_stand'].includes(p.phase))return '';
+    if(p.phase==='awaiting_stand')return '';
+    if(['at_gate','ready'].includes(p.phase)){
+      const gateIndex=state.airport.gates.findIndex(g=>g.id===p.gateId),bucket=Math.floor(gateIndex/bucketSize);
+      if(gateIndex<0)return '';
+      const groupAircraft=active.filter(a=>['at_gate','ready'].includes(a.phase)&&buckets[bucket].some(g=>g.id===a.gateId));
+      const rank=groupAircraft.findIndex(a=>a.id===p.id);if(rank>=3)return '';
+      x=gx(bucket)-18;y=gateY-22-rank*21;angle=0;
+    }
     if(['landing','takeoff'].includes(p.phase)){const duration=p.phase==='landing'?60:45;x=150+(1-p.remainingSeconds/duration)*810;y=93+Math.max(0,runways.findIndex(r=>r.id===p.runwayId))*80;}
     else if(['taxi_in','taxi_out','holding_short'].includes(p.phase)){x=p.taxiwayId==='TWY-A'?175:945;y=apronY-25;}
     return `<g data-pilot="${p.id}" role="button" tabindex="0" aria-label="Inspect pilot ${esc(p.id)}"><path transform="translate(${x} ${y}) rotate(${angle})" d="M0-12 3-3 11 3 11 6 3 3 2 10 5 12 5 14 0 12-5 14-5 12-2 10-3 3-11 6-11 3-3-3Z" fill="#edf1e9"/><text x="${x+18}" y="${y+4}" fill="#c9d9cf" font-size="10">${esc(p.callsign)}</text></g>`;
@@ -57,16 +65,36 @@ function render(s) {
   const active=s.pilots.filter(p=>!['departed','diverted'].includes(p.phase)).length, runwayCount=s.airport.runways.filter(r=>r.status==='open').length;
   const freeGates=s.airport.gates.filter(g=>g.status==='open'&&!g.occupiedBy&&!g.backgroundOccupied).length, incidents=s.incidents.filter(i=>i.status==='active').length;
   $('metrics').innerHTML=[['ACTIVE AIRCRAFT',active,`${s.pilots.length} flights · ${s.data?.flightImports.length||0} imported`],['OPEN RUNWAYS',`${runwayCount}<em>/ ${s.airport.runways.length}</em>`,'Availability excludes reservations'],['AVAILABLE STANDS',`${freeGates}<em>/ ${s.airport.gates.length}</em>`,'Excludes synthetic background occupancy'],['DISRUPTIONS',incidents+(s.data?.disruptions.length||0),`${s.data?.disruptions.length||0} imported · ${incidents} active physical`]].map(([label,n,note])=>`<div class="metric"><span class="metric-label">${label}</span><div class="metric-number" ${label==='DISRUPTIONS'&&(incidents||s.data?.disruptions.length)?'style="color:var(--orange)"':''}>${n}</div><small>${note}</small></div>`).join('');
-  $('map').innerHTML=svgMap(); renderGateInventory(); renderImportState();
+  $('map').innerHTML=svgMap(); renderGateInventory(); renderImportState(); renderGateOperations();
   $('clock-zone').textContent=`${new Date(now()).toLocaleDateString('en-CA',{timeZone:timezone()})} · ${timezone()}`; $('flight-timezone').textContent=`Fuel kg · times ${timezone()}`; $('airport-tag').textContent=`${s.airport.id} / SCHEMATIC`; $('map-label').textContent=`${s.airport.id} / SCHEMATIC`;
   if(selectedResource) renderResource();else $('resource-detail').textContent='Select a runway, taxiway, or gate group to inspect its state.';
   $('flight-count').textContent=String(s.pilots.length);
-  $('flights').innerHTML=s.pilots.map(p=>`<tr data-pilot="${p.id}" tabindex="0"><td><strong>${esc(p.callsign)}</strong><small>${p.source==='historical_import'?'IMPORTED / '+esc(p.flightId):'SYNTHETIC / '+p.id}</small></td><td>${phase(p.phase)}${p.maintenanceHold?'<small style="color:var(--orange)">Maintenance hold</small>':''}</td><td>${Math.round(p.fuelRemainingKg).toLocaleString()}<div class="fuel-bar"><i style="width:${Math.min(100,p.fuelRemainingKg/5000*100)}%;${p.fuelRemainingKg<1200?'background:var(--orange)':''}"></i></div></td><td>${shortTime(p.expectedArrival)}</td><td>${shortTime(p.expectedDeparture)}</td><td>${esc(p.gateId||'—')}</td></tr>`).join('');
+  $('flights').innerHTML=s.pilots.map(p=>`<tr data-pilot="${p.id}" tabindex="0"><td><strong>${esc(p.callsign)}</strong><small>${p.source==='historical_import'?'IMPORTED / '+esc(p.flightId):'SYNTHETIC / '+p.id}</small></td><td>${phase(p.phase)}${['at_gate','ready'].includes(p.phase)?`<small>${gateStatus(state,p).turnaroundRemainingSeconds===null?'Turnaround unknown':`Turnaround ${duration(gateStatus(state,p).turnaroundRemainingSeconds)}`}</small>`:''}${p.maintenanceHold?'<small style="color:var(--orange)">Maintenance hold</small>':''}</td><td>${Math.round(p.fuelRemainingKg).toLocaleString()}<div class="fuel-bar"><i style="width:${Math.min(100,p.fuelRemainingKg/5000*100)}%;${p.fuelRemainingKg<1200?'background:var(--orange)':''}"></i></div></td><td>${shortTime(p.expectedArrival)}</td><td>${shortTime(p.expectedDeparture)}</td><td>${esc(p.gateId||'—')}</td></tr>`).join('');
   const titles=['Emergency response','Mechanics','Inspectors'];
   $('crews').innerHTML=s.ground.crews.map((group,i)=>`<div class="crew-group"><div class="crew-title"><i class="dot ${['orange','blue','green'][i]}"></i>${titles[i]} <span>${group.length}</span></div>${group.map(c=>{const t=s.tasks.find(t=>t.id===c.currentTaskId);return `<div class="crew-card" data-crew="${c.id}" role="button" tabindex="0"><div class="crew-card-top"><span class="crew-id">${c.id}</span>${phase(c.status)}</div><p>${t?esc(t.title):esc(c.name)}<br>${esc(c.location)}${t?` · ${t.remainingSeconds}s remaining`:''}</p>${t?`<div class="task-progress"><i style="width:${(1-t.remainingSeconds/t.totalSeconds)*100}%"></i></div>`:''}</div>`}).join('')}</div>`).join('');
   $('events').innerHTML=s.events.map(e=>`<div class="event ${esc(e.kind)}"><time>${clock(e.at)}</time><i class="event-dot"></i><span>${esc(e.message)}</span></div>`).join(''); $('event-count').textContent=`${s.events.length} events retained`;
   renderTargets(); renderAgents(); void refreshObservation();
 }
+const duration = seconds => `${Math.floor(seconds/60)}:${String(seconds%60).padStart(2,'0')}`;
+function renderGateOperations() {
+  const parked=state.pilots.filter(p=>['at_gate','ready','awaiting_stand'].includes(p.phase));
+  const select=$('gate-flight-select'),previous=select.value;
+  $('gate-operation-count').textContent=`${parked.length} PARKED / WAITING`;
+  const options=parked.map(p=>`<option value="${esc(p.id)}">${esc(p.callsign)} · ${esc(p.gateId||'Awaiting stand')}</option>`).join('');
+  if(select.innerHTML!==options){select.innerHTML=options;if(parked.some(p=>p.id===previous))select.value=previous;}
+  select.disabled=!parked.length;
+  const p=parked.find(p=>p.id===select.value);
+  if(!p){$('gate-operations').innerHTML='<p class="gate-empty">No parked aircraft. A countdown appears when an aircraft reaches its gate.</p>';return;}
+  const status=gateStatus(state,p),unknown=status.turnaroundRemainingSeconds===null;
+  const label=p.phase==='awaiting_stand'?'Waiting for a stand':unknown?'Turnaround history unavailable':status.turnaroundRemainingSeconds>0?'Turnaround remaining':'Turnaround complete';
+  $('gate-operations').innerHTML=`<div class="gate-status-top"><div><span>${esc(p.callsign)} · ${esc(p.gateId||'No stand assigned')}</span><strong>${esc(label)}</strong></div><div class="gate-countdown ${unknown?'unknown':''}">${unknown?'Unknown':duration(status.turnaroundRemainingSeconds)}<small>${unknown?'No preceding on-block time':'minutes : seconds'}</small></div></div>
+    <div class="gate-release"><strong>${status.readyForPushback?'Ready for pushback on next simulation step':'Pushback waiting'}</strong><span>${status.blockers.map(esc).join(' · ')||'Timing, readiness and outbound route checks passed.'}</span>${status.departureWaitSeconds?`<span>Departure timing release ${shortTime(status.departureReleaseAt)} · ${duration(status.departureWaitSeconds)} away</span>`:''}</div>
+    <p class="gate-assumption">${esc(status.basis)} ${unknown?'The imported departure delay still applies.':'This timer advances with simulation time. Gate occupancy continues until pushback; a completed countdown does not override departure restrictions.'}</p>
+    <button id="inspect-gate-pilot" class="small-btn quiet">Inspect ${esc(p.callsign)} JSON</button>`;
+  $('inspect-gate-pilot').onclick=()=>{selectedRole='pilot';selectedId=p.id;renderAgents();void refreshObservation();};
+}
+$('gate-flight-select').onchange=renderGateOperations;
+
 function renderTargets() {
   const kind=$('incident-kind').value, previous=$('incident-target').value;
   const list=kind==='aircraft_fault'?state.pilots.filter(p=>['at_gate','ready'].includes(p.phase)&&!p.maintenanceHold).map(p=>({id:p.id,name:p.callsign})):

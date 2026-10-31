@@ -74,6 +74,9 @@ export function createSimulatorServer({ persist = true, dataFile = path.join(roo
         return json(res, 404, { error: 'Unknown endpoint.' });
       }
       if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed.' });
+      if(url.pathname==='/gate-status.js'){
+        res.writeHead(200,{'Content-Type':'text/javascript','Cache-Control':'no-cache'});return res.end(fs.readFileSync(path.join(root,'src/gate-status.mjs')));
+      }
       const files = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/imports.js': ['imports.js','text/javascript'], '/style.css': ['style.css', 'text/css'], '/favicon.svg': ['favicon.svg', 'image/svg+xml'] };
       const file = files[url.pathname];
       if (!file) return json(res, 404, { error: 'Not found.' });

@@ -33,6 +33,16 @@ The schematic groups large gate inventories into at most 12 cards. Select a grou
 
 Reset is explicit and clears flights/imported scenarios back to the demo seed, but retains the airport catalog so it can be reapplied. Switching airports or aligning the clock requires a paused simulation with no active surface movements or synthetic incidents. Changing airports after flight injection requires an explicit reset.
 
+## Gate countdown
+
+The **Turnaround countdown** panel lists parked aircraft and those waiting for a stand. Choose an aircraft to see its existing timer in minutes:seconds. The same countdown appears on the flight board. Parked aircraft remain visible on the schematic (up to three icons per aggregated gate group; the group count and full inventory retain all aircraft).
+
+Run or step advances the countdown; Pause freezes it. Reaching `0:00` means the simulated turnaround timer has completed. Departure time, maintenance holds, gate restrictions and outbound taxiway availability can still block pushback; these are shown separately. A maintenance hold blocks departure while the existing turnaround timer continues. No individual boarding, cleaning, refuelling or baggage tasks are simulated.
+
+Imported flights without a preceding on-block timestamp show **Unknown** rather than an invented countdown. Their existing readiness assumption and imported departure delay still apply. This display never starts or resets a timer, changes fuel, or assigns additional crews.
+
+ATC observations expose a read-only `gateOperations` list; individual Pilot observations expose `gateStatus`. Both derive from the same state/timers used by the dashboard. Full-state exports retain the underlying timers in `pilots[].remainingSeconds` and `onBlockAt`; no snapshot migration is required.
+
 ## Airport inputs
 
 Required columns:
@@ -126,6 +136,8 @@ Existing manual actions remain: ATC `set_plan`/`resource_status`; individual Pil
 
 The automated suite covers CSV/TSV parsing, all supplied rows, strict thresholds, missing/signed values, clock rollover/DST, airport lookup, resource inventories, spare gates, capacity, turnaround, atomic failures, duplicate protection, clock alignment, once-only delay application, scoped observations, HTTP responses, persistence/restart and legacy migration. Run `npm test` for the current count and results.
 
+All 35 automated tests passed after adding the gate countdown.
+
 Browser checks cover airport import and selection, DFW's 4-runway/150-gate overview, selecting exactly one of 19 flights, AA5 injection, TSV upload, duplicate prevention, SFO's 3-runway/70-gate configuration and individual gate inspection. JSON is read from the same backend as the flight board.
 
 Remaining challenge definitions: capacity scope is explicitly operator-selected; background gate occupancy and taxiway geometry are synthetic; fuel and wake-separation challenge workbooks are not part of this import task. Existing synthetic fuel burn/reserve and runway occupancy/reuse assumptions remain labelled in observations. No claim is made to simulate real airport safety or a complete multi-agent solution.
@@ -133,6 +145,7 @@ Remaining challenge definitions: capacity scope is explicitly operator-selected;
 ## Source layout
 
 - `src/data.mjs`: CSV/TSV parsing, airport schemas, flight validation, HHMM/date/timezone normalisation.
+- `src/gate-status.mjs`: shared read-only gate countdown and departure-blocker view.
 - `src/scenario.mjs`: atomic airport application, selected-row injection, provenance and snapshot migration.
 - `src/simulator.mjs`: authoritative state, resource transitions, capacity, personnel, scoped observations and invariants.
 - `server.mjs`: local HTTP API, persistence and event stream.
