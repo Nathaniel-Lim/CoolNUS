@@ -1,0 +1,9 @@
+{
+  "name": "coolnus-airport-simulator",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Deterministic airport simulation with scoped agent observations",
+  "scripts": { "start": "node server.mjs", "test": "node --test" },
+  "engines": { "node": ">=20" }
+}
